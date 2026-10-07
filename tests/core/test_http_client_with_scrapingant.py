@@ -3,7 +3,9 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from backend.core.flaresolverr import FlareSolverrConfig
 from backend.core.http_client import _MailAccessClient, _RoutedMailAccessClient, build_client
+from backend.core.proxy import ProxyConnectionError
 from backend.core.scrapingant import ScrapingAntConfig
 
 
@@ -443,3 +445,86 @@ async def test_use_proxies_flag_sets_strict_mode_by_default() -> None:
             # strict_proxy NOT passed — should default to True
         ) as client:
             await client.get("https://example.com/check")
+
+
+def _flaresolverr_config(
+    *,
+    enabled: bool = True,
+    strict: bool = False,
+    domains: tuple[str, ...] = ("duckduckgo.com",),
+) -> FlareSolverrConfig:
+    return FlareSolverrConfig(
+        enabled=enabled,
+        endpoint="http://flaresolverr.local/v1",
+        timeout_ms=60000,
+        strict=strict,
+        domains=domains,
+    )
+
+
+async def test_flaresolverr_matching_domain_routes_request() -> None:
+    calls: list[str] = []
+
+    async def flaresolverr_handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "solution": {
+                    "status": 200,
+                    "response": "<html>ok</html>",
+                    "headers": {"content-type": "text/html"},
+                },
+            },
+            request=request,
+        )
+
+    async with build_client(
+        _flaresolverr_config=_flaresolverr_config(enabled=True),
+        _flaresolverr_transport=httpx.MockTransport(flaresolverr_handler),
+        transport=httpx.MockTransport(lambda request: httpx.Response(500, request=request)),
+    ) as client:
+        response = await client.get("https://html.duckduckgo.com/html/?q=test")
+
+    assert response.status_code == 200
+    assert response.text == "<html>ok</html>"
+    assert calls == ["http://flaresolverr.local/v1"]
+
+
+async def test_flaresolverr_non_matching_domain_uses_direct_transport() -> None:
+    async with build_client(
+        _flaresolverr_config=_flaresolverr_config(enabled=True, domains=("duckduckgo.com",)),
+        _flaresolverr_transport=httpx.MockTransport(lambda request: httpx.Response(500, request=request)),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="direct", request=request)),
+    ) as client:
+        response = await client.get("https://api.github.com/users/octocat")
+
+    assert response.text == "direct"
+
+
+async def test_flaresolverr_failure_falls_back_when_not_strict() -> None:
+    async def flaresolverr_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "error", "message": "captcha failed"}, request=request)
+
+    async with build_client(
+        _flaresolverr_config=_flaresolverr_config(enabled=True, strict=False),
+        _flaresolverr_transport=httpx.MockTransport(flaresolverr_handler),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="direct", request=request)),
+    ) as client:
+        response = await client.get("https://duckduckgo.com/?q=test")
+
+    assert response.text == "direct"
+
+
+async def test_flaresolverr_failure_raises_when_strict() -> None:
+    async def flaresolverr_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "error", "message": "captcha failed"}, request=request)
+
+    async with build_client(
+        _flaresolverr_config=_flaresolverr_config(enabled=True, strict=True),
+        _flaresolverr_transport=httpx.MockTransport(flaresolverr_handler),
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="direct", request=request)),
+    ) as client:
+        with pytest.raises(ProxyConnectionError):
+            await client.get("https://duckduckgo.com/?q=test")
