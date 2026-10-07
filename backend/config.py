@@ -120,6 +120,37 @@ def _coerce_mapping(
     return parsed_mapping
 
 
+def _coerce_string_list(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    items: list[Any]
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("Invalid JSON for %s; falling back to comma parsing", field_name)
+            else:
+                if isinstance(parsed, list):
+                    items = parsed
+                    return [str(item).strip() for item in items if str(item).strip()]
+                logger.warning("%s JSON value is not a list; falling back to comma parsing", field_name)
+        items = raw.split(",")
+    elif isinstance(value, list | tuple | set):
+        items = list(value)
+    else:
+        logger.warning(
+            "Unsupported %s value type %s; using empty list",
+            field_name,
+            type(value).__name__,
+        )
+        return []
+    return [str(item).strip() for item in items if str(item).strip()]
+
+
 class _MailAccessSettingsSourceMixin:
     def prepare_field_value(
         self,
@@ -858,6 +889,14 @@ class Settings(BaseSettings):
     scrapingant_proxy_residential_password: str | None = None
     scrapingant_proxy_datacenter_username: str | None = None
     scrapingant_proxy_datacenter_password: str | None = None
+    flaresolverr_enabled: bool = False
+    flaresolverr_endpoint: str = "http://localhost:8191/v1"
+    flaresolverr_timeout_ms: int = 60000
+    flaresolverr_strict: bool = False
+    flaresolverr_domains: list[str] = [
+        "duckduckgo.com",
+        "bing.com",
+    ]
 
     # 0.11.1 Phase 1 — Stealth HTTP client (harvest mode only).
     # ``harvest_timing_profile`` selects one of the six T0..T5 pacing
@@ -946,6 +985,11 @@ class Settings(BaseSettings):
     @classmethod
     def _validate_rate_limit_delays(cls, value: Any) -> dict[str, Any]:
         return _coerce_mapping(value, "rate_limit_delays", float)
+
+    @field_validator("flaresolverr_domains", mode="before")
+    @classmethod
+    def _validate_flaresolverr_domains(cls, value: Any) -> list[str]:
+        return _coerce_string_list(value, "flaresolverr_domains")
 
     @classmethod
     def settings_customise_sources(

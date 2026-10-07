@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from .flaresolverr import FlareSolverrError, FlareSolverrTransport, flaresolverr_config
 from .proxy import ProxyConnectionError, proxy_config
 from .rate_limiter import rate_limiter
 from .scrapingant import (
@@ -64,12 +65,21 @@ def build_client(
 
     kwargs.setdefault("timeout", 10.0)
     event_hooks: dict[str, list[Any]] = {"request": [_before_request]}
+    flaresolverr_cfg = kwargs.pop("_flaresolverr_config", flaresolverr_config)
+    flaresolverr_transport = kwargs.pop("_flaresolverr_transport", None)
 
     proxy_url = proxy_config.proxy_url()
     if proxy_url:
         kwargs["proxy"] = proxy_url
 
-    return _MailAccessClient(event_hooks=event_hooks, **kwargs)
+    return _MailAccessClient(
+        event_hooks=event_hooks,
+        flaresolverr_transport=FlareSolverrTransport(
+            flaresolverr_cfg,
+            transport=flaresolverr_transport,
+        ),
+        **kwargs,
+    )
 
 
 def build_routed_client(zone: str, **kwargs: Any) -> _RoutedMailAccessClient:
@@ -84,6 +94,8 @@ def build_routed_client(zone: str, **kwargs: Any) -> _RoutedMailAccessClient:
     config = kwargs.pop("_scrapingant_config", scrapingant_config)
     rest_transport = kwargs.pop("_scrapingant_rest_transport", None)
     proxy_transport = kwargs.pop("_scrapingant_proxy_transport", None)
+    flaresolverr_cfg = kwargs.pop("_flaresolverr_config", flaresolverr_config)
+    flaresolverr_transport = kwargs.pop("_flaresolverr_transport", None)
     strict_proxy = kwargs.pop("strict_proxy", True)
     kwargs.setdefault("timeout", 10.0)
     event_hooks: dict[str, list[Any]] = {"request": [_before_request]}
@@ -100,6 +112,10 @@ def build_routed_client(zone: str, **kwargs: Any) -> _RoutedMailAccessClient:
             proxy_transport=proxy_transport,
             strict_proxy=strict_proxy,
         ),
+        flaresolverr_transport=FlareSolverrTransport(
+            flaresolverr_cfg,
+            transport=flaresolverr_transport,
+        ),
         event_hooks=event_hooks,
         **kwargs,
     )
@@ -108,9 +124,33 @@ def build_routed_client(zone: str, **kwargs: Any) -> _RoutedMailAccessClient:
 class _MailAccessClient(httpx.AsyncClient):
     """AsyncClient subclass that converts proxy errors into ProxyConnectionError."""
 
+    def __init__(
+        self,
+        *args: Any,
+        flaresolverr_transport: FlareSolverrTransport | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._flaresolverr_transport = flaresolverr_transport
+
     async def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
         sem = _get_request_semaphore()
         try:
+            if (
+                self._flaresolverr_transport is not None
+                and self._flaresolverr_transport.should_route(request)
+            ):
+                try:
+                    return await self._flaresolverr_transport.send(request)
+                except FlareSolverrError as exc:
+                    if self._flaresolverr_transport.strict:
+                        raise ProxyConnectionError(
+                            "FlareSolverr request failed and strict mode is enabled"
+                        ) from exc
+                    logger.warning(
+                        "[yellow]⚠ FlareSolverr failed for %s — fell back to direct connection[/yellow]",
+                        request.url.host,
+                    )
             if sem is not None:
                 async with sem:
                     return await super().send(request, **kwargs)
